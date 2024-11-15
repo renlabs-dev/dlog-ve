@@ -1,0 +1,9 @@
+[package]
+name = "dlog-ve"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+curv-kzen = "0.10"
+centipede = { git = "https://github.com/KZen-networks/centipede", version = "0.3.1" }
+hex = "0.4.3"
