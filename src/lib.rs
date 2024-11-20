@@ -2,13 +2,9 @@ use centipede::juggling::{
     proof_system::{Helgamalsegmented, Proof, Witness},
     segmentation::Msegmentation,
 };
-use curv::{
-    arithmetic::Converter,
-    elliptic::curves::{
-        secp256_k1::{Secp256k1Point, Secp256k1Scalar},
-        ECPoint, ECScalar, Point, Scalar,
-    },
-    BigInt,
+use curv::elliptic::curves::{
+    secp256_k1::{Secp256k1Point, Secp256k1Scalar},
+    ECPoint, Point, Scalar, Secp256k1,
 };
 
 pub const SEGMENT_SIZE: usize = 8;
@@ -47,6 +43,20 @@ pub fn encrypt(
 }
 
 pub fn decrypt(
+    private_key: Secp256k1Scalar,
+    encryptions: Helgamalsegmented,
+) -> Result<Scalar<Secp256k1>, EncryptError> {
+    let private_key = Scalar::from_raw(private_key);
+
+    let g = Secp256k1Point::generator();
+    let g = Point::from_raw(*g).map_err(MismatchedPointOrder)?;
+    let secret = Msegmentation::decrypt(&encryptions, &g, &private_key, &SEGMENT_SIZE)
+        .map_err(CentipedeErrors)?;
+
+    Ok(secret)
+}
+
+pub fn prove(
     public_key: Secp256k1Point,
     witness: Witness,
     encryptions: Helgamalsegmented,
@@ -67,7 +77,6 @@ pub fn verify(
     encryptions: Helgamalsegmented,
 ) -> Result<bool, EncryptError> {
     let encryption_key = Point::from_raw(encryption_key).map_err(MismatchedPointOrder)?;
-
     let public_key = Point::from_raw(public_key).map_err(MismatchedPointOrder)?;
 
     let g = Secp256k1Point::generator();
@@ -87,14 +96,26 @@ pub fn verify(
 
 #[cfg(test)]
 mod tests {
+    use curv::elliptic::curves::ECScalar;
+
     use super::*;
 
     #[test]
-    fn test() {
+    fn probabilistic_test() {
         let pk = *Secp256k1Point::generator();
         let sk = Secp256k1Scalar::random();
         let a = serde_json::to_string(&encrypt(pk, sk.clone()).unwrap()).unwrap();
         let b = serde_json::to_string(&encrypt(pk, sk).unwrap()).unwrap();
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn zk_test() {
+        let pk = *Secp256k1Point::generator();
+        let sk = Secp256k1Scalar::random();
+
+        let (witness, ciphertexts) = encrypt(pk, sk.clone()).unwrap();
+
+        assert!(prove(pk, witness, ciphertexts).is_ok());
     }
 }
