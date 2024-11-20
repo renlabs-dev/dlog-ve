@@ -26,15 +26,10 @@ pub enum EncryptError {
 pub use EncryptError::*;
 
 pub fn encrypt(
-    public_key: String,
-    secret: String,
+    public_key: Secp256k1Point,
+    secret: Secp256k1Scalar,
 ) -> Result<(Witness, Helgamalsegmented), EncryptError> {
-    let public_key = hex::decode(public_key).map_err(FromHexError)?;
-    let public_key = Secp256k1Point::deserialize(&public_key).map_err(DeserializationError)?;
     let public_key = Point::from_raw(public_key).map_err(MismatchedPointOrder)?;
-
-    let secret = BigInt::from_hex(&secret).map_err(ParseBigIntError)?;
-    let secret: Secp256k1Scalar = ECScalar::from_bigint(&secret);
     let secret = Scalar::from_raw(secret);
 
     let g = Secp256k1Point::generator();
@@ -52,12 +47,10 @@ pub fn encrypt(
 }
 
 pub fn decrypt(
-    public_key: String,
+    public_key: Secp256k1Point,
     witness: Witness,
     encryptions: Helgamalsegmented,
 ) -> Result<Proof, EncryptError> {
-    let public_key = hex::decode(public_key).map_err(FromHexError)?;
-    let public_key = Secp256k1Point::deserialize(&public_key).map_err(DeserializationError)?;
     let public_key = Point::from_raw(public_key).map_err(MismatchedPointOrder)?;
 
     let g = Secp256k1Point::generator();
@@ -69,17 +62,12 @@ pub fn decrypt(
 
 pub fn verify(
     proof: Proof,
-    encryption_key: String,
-    public_key: String,
+    encryption_key: Secp256k1Point,
+    public_key: Secp256k1Point,
     encryptions: Helgamalsegmented,
 ) -> Result<bool, EncryptError> {
-    let encryption_key = hex::decode(encryption_key).map_err(FromHexError)?;
-    let encryption_key =
-        Secp256k1Point::deserialize(&encryption_key).map_err(DeserializationError)?;
     let encryption_key = Point::from_raw(encryption_key).map_err(MismatchedPointOrder)?;
 
-    let public_key = hex::decode(public_key).map_err(FromHexError)?;
-    let public_key = Secp256k1Point::deserialize(&public_key).map_err(DeserializationError)?;
     let public_key = Point::from_raw(public_key).map_err(MismatchedPointOrder)?;
 
     let g = Secp256k1Point::generator();
@@ -95,4 +83,18 @@ pub fn verify(
     };
 
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test() {
+        let pk = *Secp256k1Point::generator();
+        let sk = Secp256k1Scalar::random();
+        let a = serde_json::to_string(&encrypt(pk, sk.clone()).unwrap()).unwrap();
+        let b = serde_json::to_string(&encrypt(pk, sk).unwrap()).unwrap();
+        assert_ne!(a, b);
+    }
 }
