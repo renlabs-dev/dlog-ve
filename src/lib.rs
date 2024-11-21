@@ -2,9 +2,10 @@ use centipede::juggling::{
     proof_system::{Helgamalsegmented, Proof, Witness},
     segmentation::Msegmentation,
 };
-use curv::elliptic::curves::{
-    secp256_k1::{Secp256k1Point, Secp256k1Scalar},
-    ECPoint, Point, Scalar, Secp256k1,
+use curv::{
+    arithmetic::{Converter, Modulo},
+    elliptic::curves::{Point, Scalar, Secp256k1},
+    BigInt,
 };
 
 pub const SEGMENT_SIZE: usize = 8;
@@ -19,37 +20,29 @@ pub enum EncryptError {
     MismatchedPointOrder(curv::elliptic::curves::MismatchedPointOrder),
 }
 
+use rand::Rng;
 pub use EncryptError::*;
 
 pub fn encrypt(
-    public_key: Secp256k1Point,
-    secret: Secp256k1Scalar,
+    public_key: Point<Secp256k1>,
+    secret: Scalar<Secp256k1>,
 ) -> Result<(Witness, Helgamalsegmented), EncryptError> {
-    let public_key = Point::from_raw(public_key).map_err(MismatchedPointOrder)?;
-    let secret = Scalar::from_raw(secret);
-
-    let g = Secp256k1Point::generator();
-    let g = Point::from_raw(*g).map_err(MismatchedPointOrder)?;
-
     let (witness, segments) = Msegmentation::to_encrypted_segments(
         &secret,
         &SEGMENT_SIZE,
         NUM_OF_SEGMENTS,
         &public_key,
-        &g,
+        &Point::generator(),
     );
 
     Ok((witness, segments))
 }
 
 pub fn decrypt(
-    private_key: Secp256k1Scalar,
+    private_key: Scalar<Secp256k1>,
     encryptions: Helgamalsegmented,
 ) -> Result<Scalar<Secp256k1>, EncryptError> {
-    let private_key = Scalar::from_raw(private_key);
-
-    let g = Secp256k1Point::generator();
-    let g = Point::from_raw(*g).map_err(MismatchedPointOrder)?;
+    let g = Point::generator();
     let secret = Msegmentation::decrypt(&encryptions, &g, &private_key, &SEGMENT_SIZE)
         .map_err(CentipedeErrors)?;
 
@@ -57,65 +50,84 @@ pub fn decrypt(
 }
 
 pub fn prove(
-    public_key: Secp256k1Point,
+    public_key: Point<Secp256k1>,
     witness: Witness,
-    encryptions: Helgamalsegmented,
+    encryptions: &Helgamalsegmented,
 ) -> Result<Proof, EncryptError> {
-    let public_key = Point::from_raw(public_key).map_err(MismatchedPointOrder)?;
-
-    let g = Secp256k1Point::generator();
-    let g = Point::from_raw(*g).map_err(MismatchedPointOrder)?;
-    let proof = Proof::prove(&witness, &encryptions, &g, &public_key, &SEGMENT_SIZE);
+    let g = Point::generator();
+    let proof = Proof::prove(&witness, encryptions, &g, &public_key, &SEGMENT_SIZE);
 
     Ok(proof)
 }
 
 pub fn verify(
     proof: Proof,
-    encryption_key: Secp256k1Point,
-    public_key: Secp256k1Point,
-    encryptions: Helgamalsegmented,
-) -> Result<bool, EncryptError> {
-    let encryption_key = Point::from_raw(encryption_key).map_err(MismatchedPointOrder)?;
-    let public_key = Point::from_raw(public_key).map_err(MismatchedPointOrder)?;
+    encryption_key: Point<Secp256k1>,
+    public_key: Point<Secp256k1>,
+    encryptions: &Helgamalsegmented,
+) -> bool {
+    let g = Point::generator();
+    proof
+        .verify(encryptions, &g, &encryption_key, &public_key, &SEGMENT_SIZE)
+        .inspect_err(|err| {
+            dbg!(err);
+        })
+        .is_ok()
+}
 
-    let g = Secp256k1Point::generator();
-    let g = Point::from_raw(*g).map_err(MismatchedPointOrder)?;
-    let Ok(()) = proof.verify(
-        &encryptions,
-        &g,
-        &encryption_key,
-        &public_key,
-        &SEGMENT_SIZE,
-    ) else {
-        return Ok(false);
+pub fn gen_key_pair<R: Rng>(rng: &mut R) -> (Point<Secp256k1>, Scalar<Secp256k1>) {
+    let mut bytes = [0u8; 32];
+    rng.fill_bytes(&mut bytes);
+    (gen_random_point(&bytes), Scalar::random())
+}
+
+fn gen_random_point(bytes: &[u8]) -> Point<Secp256k1> {
+    let compressed_point_len = secp256k1::constants::PUBLIC_KEY_SIZE;
+    let truncated = if bytes.len() > compressed_point_len - 1 {
+        &bytes[0..compressed_point_len - 1]
+    } else {
+        bytes
     };
+    let mut buffer = [0u8; secp256k1::constants::PUBLIC_KEY_SIZE];
+    buffer[0] = 0x2;
+    buffer[1..1 + truncated.len()].copy_from_slice(truncated);
+    if let Ok(point) = Point::from_bytes(&buffer) {
+        return point;
+    }
 
-    Ok(true)
+    let bn = BigInt::from_bytes(bytes);
+    let two = BigInt::from(2);
+    let bn_times_two = BigInt::mod_mul(&bn, &two, Scalar::<Secp256k1>::group_order());
+    let bytes = BigInt::to_bytes(&bn_times_two);
+    gen_random_point(&bytes)
 }
 
 #[cfg(test)]
 mod tests {
-    use curv::elliptic::curves::ECScalar;
+    use rand::thread_rng;
 
     use super::*;
 
     #[test]
     fn probabilistic_test() {
-        let pk = *Secp256k1Point::generator();
-        let sk = Secp256k1Scalar::random();
-        let a = serde_json::to_string(&encrypt(pk, sk.clone()).unwrap()).unwrap();
-        let b = serde_json::to_string(&encrypt(pk, sk).unwrap()).unwrap();
+        let (encryption_key, _decryption_key) = gen_key_pair(&mut thread_rng());
+        let (_public_key, secret_key) = gen_key_pair(&mut thread_rng());
+
+        let a =
+            serde_json::to_string(&encrypt(encryption_key.clone(), secret_key.clone()).unwrap())
+                .unwrap();
+        let b = serde_json::to_string(&encrypt(encryption_key, secret_key).unwrap()).unwrap();
         assert_ne!(a, b);
     }
 
     #[test]
     fn zk_test() {
-        let pk = *Secp256k1Point::generator();
-        let sk = Secp256k1Scalar::random();
+        let (encryption_key, _decryption_key) = gen_key_pair(&mut thread_rng());
+        let (public_key, secret_key) = gen_key_pair(&mut thread_rng());
+        let (witness, ciphertexts) = encrypt(encryption_key.clone(), secret_key.clone()).unwrap();
+        let proof = prove(encryption_key.clone(), witness, &ciphertexts).unwrap();
+        let verified = verify(proof, encryption_key, public_key, &ciphertexts);
 
-        let (witness, ciphertexts) = encrypt(pk, sk.clone()).unwrap();
-
-        assert!(prove(pk, witness, ciphertexts).is_ok());
+        assert!(dbg!(verified));
     }
 }
