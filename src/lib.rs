@@ -1,6 +1,9 @@
-use centipede::juggling::{
-    proof_system::{Helgamalsegmented, Proof, Witness},
-    segmentation::Msegmentation,
+use centipede::{
+    juggling::{
+        proof_system::{Helgamalsegmented, Proof, Witness},
+        segmentation::Msegmentation,
+    },
+    wallet::SecretShare,
 };
 use curv::elliptic::curves::{Point, Scalar, Secp256k1};
 
@@ -18,91 +21,108 @@ pub enum EncryptError {
 
 pub use EncryptError::*;
 
-pub fn encrypt(
-    public_key: Point<Secp256k1>,
-    secret: Scalar<Secp256k1>,
-) -> Result<(Witness, Helgamalsegmented), EncryptError> {
-    let (witness, segments) = Msegmentation::to_encrypted_segments(
-        &secret,
-        &SEGMENT_SIZE,
-        NUM_OF_SEGMENTS,
-        &public_key,
-        &Point::generator(),
-    );
+pub type Result<T, E = EncryptError> = std::result::Result<T, E>;
 
-    Ok((witness, segments))
+#[repr(transparent)]
+pub struct EncKeyPair(pub SecretShare);
+
+impl Default for EncKeyPair {
+    #[inline(always)]
+    fn default() -> Self {
+        Self(SecretShare::generate())
+    }
 }
 
-pub fn decrypt(
-    private_key: Scalar<Secp256k1>,
-    encryptions: Helgamalsegmented,
-) -> Result<Scalar<Secp256k1>, EncryptError> {
-    let g = Point::generator();
-    let secret = Msegmentation::decrypt(&encryptions, &g, &private_key, &SEGMENT_SIZE)
-        .map_err(CentipedeErrors)?;
+impl EncKeyPair {
+    #[inline(always)]
+    pub fn encrypt(&self, secret: &DLogKeyPair) -> (Witness, Helgamalsegmented) {
+        let EncKeyPair(enc) = self;
+        let DLogKeyPair(dlog) = secret;
+        Msegmentation::to_encrypted_segments(
+            &dlog.secret,
+            &SEGMENT_SIZE,
+            NUM_OF_SEGMENTS,
+            &enc.pubkey,
+            &Point::generator(),
+        )
+    }
 
-    Ok(secret)
+    #[inline(always)]
+    pub fn decrypt(&self, ciphertexts: Helgamalsegmented) -> Result<Scalar<Secp256k1>> {
+        let EncKeyPair(enc) = self;
+        let g = Point::generator();
+        let secret = Msegmentation::decrypt(&ciphertexts, &g, &enc.secret, &SEGMENT_SIZE)
+            .map_err(CentipedeErrors)?;
+
+        Ok(secret)
+    }
+
+    #[inline(always)]
+    pub fn prove(&self, witness: Witness, encryptions: &Helgamalsegmented) -> Proof {
+        let EncKeyPair(enc) = self;
+        let g = Point::generator();
+        Proof::prove(&witness, encryptions, &g, &enc.pubkey, &SEGMENT_SIZE)
+    }
 }
 
-pub fn prove(
-    public_key: Point<Secp256k1>,
-    witness: Witness,
-    encryptions: &Helgamalsegmented,
-) -> Result<Proof, EncryptError> {
-    let g = Point::generator();
-    let proof = Proof::prove(&witness, encryptions, &g, &public_key, &SEGMENT_SIZE);
+#[repr(transparent)]
+pub struct DLogKeyPair(pub SecretShare);
 
-    Ok(proof)
+impl Default for DLogKeyPair {
+    #[inline(always)]
+    fn default() -> Self {
+        Self(SecretShare::generate())
+    }
 }
 
-pub fn verify(
-    proof: Proof,
-    encryption_key: Point<Secp256k1>,
-    public_key: Point<Secp256k1>,
-    encryptions: &Helgamalsegmented,
-) -> bool {
-    let g = Point::generator();
-    proof
-        .verify(encryptions, &g, &encryption_key, &public_key, &SEGMENT_SIZE)
-        .is_ok()
+pub trait Verifiable {
+    fn check(&self, enc: &EncKeyPair, dlog: &DLogKeyPair, ciphertexts: &Helgamalsegmented) -> bool;
+}
+
+impl Verifiable for Proof {
+    #[inline(always)]
+    fn check(&self, enc: &EncKeyPair, dlog: &DLogKeyPair, ciphertexts: &Helgamalsegmented) -> bool {
+        let EncKeyPair(enc) = enc;
+        let DLogKeyPair(dlog) = dlog;
+        let g = Point::generator();
+        self.verify(ciphertexts, &g, &enc.pubkey, &dlog.pubkey, &SEGMENT_SIZE)
+            .is_ok()
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use centipede::wallet::SecretShare;
-
     use super::*;
 
     #[test]
     fn probabilistic_test() {
-        let enc = SecretShare::generate();
-        let dlog = SecretShare::generate();
+        let enc = EncKeyPair::default();
+        let dlog = DLogKeyPair::default();
 
-        let a = serde_json::to_string(&encrypt(enc.pubkey.clone(), dlog.secret.clone()).unwrap())
-            .unwrap();
-        let b = serde_json::to_string(&encrypt(enc.pubkey, dlog.secret).unwrap()).unwrap();
+        let a = serde_json::to_string(&enc.encrypt(&dlog)).unwrap();
+        let b = serde_json::to_string(&enc.encrypt(&dlog)).unwrap();
         assert_ne!(a, b);
     }
 
     #[test]
     fn zk_test() {
-        let enc = SecretShare::generate();
-        let dlog = SecretShare::generate();
-        let (witness, ciphertexts) = encrypt(enc.pubkey.clone(), dlog.secret.clone()).unwrap();
-        let proof = prove(enc.pubkey.clone(), witness, &ciphertexts).unwrap();
-        let verified = verify(proof, enc.pubkey, dlog.pubkey, &ciphertexts);
+        let enc = EncKeyPair::default();
+        let dlog = DLogKeyPair::default();
+        let (witness, ciphertexts) = enc.encrypt(&dlog);
+        let proof = enc.prove(witness, &ciphertexts);
+        let verified = proof.check(&enc, &dlog, &ciphertexts);
 
-        assert!(dbg!(verified));
+        assert!(verified);
     }
 
     #[test]
     fn zk_wrong_test_1() {
-        let enc = SecretShare::generate();
-        let dlog = SecretShare::generate();
-        let random_dlog = SecretShare::generate();
-        let (witness, ciphertexts) = encrypt(enc.pubkey.clone(), dlog.secret.clone()).unwrap();
-        let proof = prove(enc.pubkey.clone(), witness, &ciphertexts).unwrap();
-        let verified = verify(proof, random_dlog.pubkey, dlog.pubkey, &ciphertexts);
+        let enc = EncKeyPair::default();
+        let dlog = DLogKeyPair::default();
+        let random_dlog = DLogKeyPair::default();
+        let (witness, ciphertexts) = enc.encrypt(&dlog);
+        let proof = enc.prove(witness, &ciphertexts);
+        let verified = proof.check(&enc, &random_dlog, &ciphertexts);
 
         assert!(!verified);
     }
